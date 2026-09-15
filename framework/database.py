@@ -14,35 +14,9 @@ from pathlib import Path
 
 import duckdb
 import polars as pl
-import sqlglot
-from sqlglot.errors import ParseError
 
 # Path to the consolidated database file
 DATABASE_PATH = Path(__file__).parent.parent / "hecks.duckdb"
-
-@dataclass
-class QueryValidationResult:
-    """Result of SQL query validation."""
-    is_valid: bool
-    error_message: str | None = None
-
-
-def validate_query(query: str) -> QueryValidationResult:
-    """Validate a SQL query string using SQLGlot.
-
-    Args:
-        query: (Potentially invalid) SQL query string.
-
-    Returns:
-        QueryValidationResult with is_valid=True if syntactically valid,
-        False with error_message otherwise.
-    """
-    try:
-        _ = sqlglot.parse_one(query, read="duckdb")
-    except ParseError as e:
-        return QueryValidationResult(is_valid=False, error_message=str(e))
-    return QueryValidationResult(is_valid=True)
-
 
 @dataclass
 class QueryExecutionResult:
@@ -88,21 +62,17 @@ def execute_query(query: str) -> QueryExecutionResult:
         ...     print(f"Error: {result.error_message}")
     """
     try:
-        conn = duckdb.connect(str(DATABASE_PATH), read_only=True)
-        result = conn.execute(query)
-        df = pl.DataFrame(result.fetch_arrow_table())
+        with duckdb.connect(str(DATABASE_PATH), read_only=True) as connection:
+            result = connection.execute(query)
+            df = pl.DataFrame(result.fetch_arrow_table())
         return QueryExecutionResult(dataframe=df)
     except duckdb.Error as e:
         return QueryExecutionResult(dataframe=None, error_message=f"DuckDB error: {e}")
     except Exception as e:
         return QueryExecutionResult(dataframe=None, error_message=str(e))
-    finally:
-        conn.close()
 
 
-# Helper functions for listing schemas and tables
-# You can use these to make a tool if you like!
-
+# Helpers used by the schema exploration tools
 def list_schemas() -> list[str]:
     """List all available schemas (databases) in the consolidated database.
 
@@ -110,76 +80,104 @@ def list_schemas() -> list[str]:
         Sorted list of schema names.
     """
     try:
-        conn = duckdb.connect(str(DATABASE_PATH), read_only=True)
-        result = conn.execute("""
-            SELECT DISTINCT table_schema
-            FROM information_schema.tables
-            WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
-            ORDER BY table_schema
-        """).fetchall()
+        with duckdb.connect(str(DATABASE_PATH), read_only=True) as connection:
+            result = connection.execute("""
+                SELECT DISTINCT table_schema
+                FROM information_schema.tables
+                WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+                ORDER BY table_schema
+            """).fetchall()
         return [row[0] for row in result]
     except Exception:
         return []
-    finally:
-        conn.close()
 
 
-def list_tables(schema_name: str) -> list[str] | None:
+def list_tables(schema_name: str) -> list[str]:
     """List all tables in a schema.
 
     Args:
         schema_name: Name of the schema (e.g., "financial").
 
     Returns:
-        List of table names, or None if schema not found.
+        List of table names, or an empty list if the schema is not found.
     """
     try:
-        conn = duckdb.connect(str(DATABASE_PATH), read_only=True)
-        result = conn.execute(
-            """
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = ? AND table_type = 'BASE TABLE'
-            ORDER BY table_name
-            """,
-            [schema_name],
-        ).fetchall()
+        with duckdb.connect(str(DATABASE_PATH), read_only=True) as connection:
+            result = connection.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = ? AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+                """,
+                [schema_name],
+            ).fetchall()
         return [row[0] for row in result]
     except Exception:
         return []
-    finally:
-        conn.close()
+
+
+def search_catalog(search_term: str) -> list[str]:
+    """Search the catalog and group matching columns by schema and table."""
+    if not search_term.strip():
+        return []
+
+    pattern = f"%{search_term.strip()}%"
+    try:
+        # Keep discovery deterministic; the agent compares plausible matches by coverage.
+        with duckdb.connect(str(DATABASE_PATH), read_only=True) as connection:
+            result = connection.execute(
+                """
+                SELECT table_schema, table_name, column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+                  AND (
+                      table_schema ILIKE ?
+                      OR table_name ILIKE ?
+                      OR column_name ILIKE ?
+                  )
+                ORDER BY table_schema, table_name, ordinal_position
+                LIMIT 100
+                """,
+                [pattern, pattern, pattern],
+            ).fetchall()
+        grouped: dict[tuple[str, str], list[str]] = {}
+        for schema_name, table_name, column_name, data_type in result:
+            grouped.setdefault((schema_name, table_name), []).append(
+                f"  - {column_name} ({data_type})"
+            )
+
+        return [
+            f"{schema_name}.{table_name}\n" + "\n".join(columns)
+            for (schema_name, table_name), columns in grouped.items()
+        ]
+    except Exception:
+        return []
+
 
 def describe_table(schema_name: str, table_name: str) -> list[str]:
-    """Describe a table's columns with their types.
+    """Describe a table's columns using a compact DuckDB value profile.
 
     Args:
         schema_name: Name of the schema (e.g., "financial").
         table_name: Name of the table (e.g., "account").
 
     Returns:
-        List of column descriptions in "name (TYPE)" format, or empty list if not found.
+        Column types and useful value statistics, or an empty list if not found.
     """
     try:
-        conn = duckdb.connect(str(DATABASE_PATH), read_only=True)
-        # Use information_schema for reliable column lookup
-        # (DESCRIBE doesn't support parameterized identifiers)
-        result = conn.execute(
-            """
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = ? AND table_name = ?
-            ORDER BY ordinal_position
-            """,
-            [schema_name, table_name],
-        ).fetchall()
-        # Format as "column_name (TYPE, nullable)" for clarity
+        with duckdb.connect(str(DATABASE_PATH), read_only=True) as connection:
+            result = connection.execute(
+                "SUMMARIZE SELECT * FROM query_table(?)",
+                [f"{schema_name}.{table_name}"],
+            ).fetchall()
+
         columns: list[str] = []
-        for col_name, data_type, is_nullable in result:
-            nullable_str = ", nullable" if is_nullable == "YES" else ""
-            columns.append(f"{col_name} ({data_type}{nullable_str})")
+        for row in result:
+            columns.append(
+                f"{row[0]} ({row[1]}): min={row[2]}, max={row[3]}, "
+                f"approx_unique={row[4]}, count={row[10]}, null={row[11]}%"
+            )
         return columns
     except Exception:
         return []
-    finally:
-        conn.close()

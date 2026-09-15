@@ -8,6 +8,7 @@ import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 from typing import Any
 
 from framework.llm import OpenRouterClient, OpenRouterConfig, TokenUsage
@@ -15,8 +16,38 @@ from framework.llm import OpenRouterClient, OpenRouterConfig, TokenUsage
 # Prefix that indicates the agent should stop (answer was submitted)
 # This avoids global state - the tool result signals completion
 ANSWER_SUBMITTED_PREFIX = "ANSWER_SUBMITTED:"
-
+SQL_AGENT_PROMPT_PATH = Path(__file__).with_name("prompts") / "sql_agent.md"
+PROMPT_PATHS = {
+    "original": Path(__file__).with_name("prompts") / "original.md",
+    "baseline": SQL_AGENT_PROMPT_PATH,
+    "output-shape": Path(__file__).with_name("prompts") / "output_shape.md",
+    "human-workflow": Path(__file__).with_name("prompts") / "human_workflow.md",
+    "iterative-rules": Path(__file__).with_name("prompts") / "iterative_rules.md",
+}
+_GUIDED_WORKFLOW_PROMPTS = {"iterative-rules"}
+_TOOLS_REQUIRING_RECORDED_RULES = {
+    "list_schemas",
+    "search_catalog",
+    "list_tables",
+    "describe_table",
+    "run_query",
+    "submit_answer",
+}
+_NON_REPEATABLE_TOOLS = {
+    "search_guides",
+    "read_guide",
+    "list_schemas",
+    "search_catalog",
+    "list_tables",
+    "describe_table",
+    "run_query",
+}
 type ToolFunction = Callable[..., str]
+
+
+def prompt_requires_record_rules(prompt_name: str) -> bool:
+    """Return whether a prompt uses the optional rule-recording tool."""
+    return prompt_name in _GUIDED_WORKFLOW_PROMPTS
 
 
 class EventType(Enum):
@@ -234,9 +265,18 @@ class Agent:
     Only supports a single model, streaming, and an extensible tool set.
     """
 
-    def __init__(self, config: OpenRouterConfig, tools: dict[str, Tool]):
+    def __init__(
+        self,
+        config: OpenRouterConfig,
+        tools: dict[str, Tool],
+        prompt_name: str = "output-shape",
+    ):
+        if prompt_name not in PROMPT_PATHS:
+            choices = ", ".join(PROMPT_PATHS)
+            raise ValueError(f"Unknown prompt '{prompt_name}'. Choose from: {choices}")
         self.config = config
         self.tools: dict[str, Tool] = tools  # mapping from tool name to tool object
+        self.prompt_name = prompt_name
         self.client: OpenRouterClient = OpenRouterClient(config)
         self.conversation: Conversation = Conversation()
         self._compression = ContextCompressionSettings(
@@ -270,11 +310,152 @@ class Agent:
 
         if tool_call.name not in self.tools:
             return f"Error: Unknown tool '{tool_call.name}'"
+        guard_message = self._workflow_guard(tool_call)
+        if guard_message is not None:
+            return guard_message
+
+        submission_message = self._submission_guard(tool_call)
+        if submission_message is not None:
+            return submission_message
+
+        duplicate_message = self._duplicate_tool_guard(tool_call)
+        if duplicate_message is not None:
+            return duplicate_message
+
         tool = self.tools[tool_call.name]
         try:
-            return tool.function(**tool_call.arguments)
+            result = tool.function(**tool_call.arguments)
         except Exception as e:
             return f"Error executing {tool_call.name}: {e}"
+
+        if tool_call.name in _NON_REPEATABLE_TOOLS:
+            self._tool_call_results[self._tool_call_key(tool_call)] = result
+        if tool_call.name == "run_query" and result.startswith("Query succeeded"):
+            query = tool_call.arguments.get("query")
+            if isinstance(query, str):
+                query_identity = self._query_identity(query)
+                self._tested_queries.add(query_identity)
+        self._record_workflow_step(tool_call.name, result)
+        return result
+
+    @staticmethod
+    def _query_identity(query: str) -> str:
+        """Normalize harmless outer whitespace for tested-query comparisons."""
+        return query.strip().removesuffix(";").rstrip()
+
+    def _submission_guard(self, tool_call: ToolCall) -> str | None:
+        """Require the submitted SQL to match a query that ran successfully."""
+        if tool_call.name != "submit_answer" or "run_query" not in self.tools:
+            return None
+
+        query = tool_call.arguments.get("query")
+        query_identity = self._query_identity(query) if isinstance(query, str) else None
+        if query_identity not in self._tested_queries:
+            return (
+                "Submission guard: this exact SQL has not succeeded through run_query. "
+                "Call run_query with the exact final SQL, fix any error it reports, inspect "
+                "the result, and then submit the same SQL without editing it."
+            )
+        return None
+
+    @staticmethod
+    def _tool_call_key(tool_call: ToolCall) -> str:
+        """Return a stable identity for a tool name and its arguments."""
+        arguments = json.dumps(tool_call.arguments, sort_keys=True, separators=(",", ":"))
+        return f"{tool_call.name}:{arguments}"
+
+    def _duplicate_tool_guard(self, tool_call: ToolCall) -> str | None:
+        """Reject repeated exploration calls whose result is already in context."""
+        if tool_call.name not in _NON_REPEATABLE_TOOLS:
+            return None
+        key = self._tool_call_key(tool_call)
+        if key not in self._tool_call_results:
+            return None
+
+        attempts = self._duplicate_tool_attempts.get(key, 0) + 1
+        self._duplicate_tool_attempts[key] = attempts
+        previous_result = _truncate_tool_result(self._tool_call_results[key], 300)
+
+        if attempts == 1:
+            return (
+                f"Duplicate tool guard: {tool_call.name} was already called with these exact "
+                f"arguments. Previous result: {previous_result}\n"
+                "Required next action: do not repeat this call. Use the existing result, "
+                "choose meaningfully different arguments based on new evidence, or proceed "
+                "with the best-supported query."
+            )
+
+        return (
+            f"Duplicate tool escalation: this exact {tool_call.name} call has now been "
+            f"rejected {attempts} times. Previous result: {previous_result}\n"
+            "Required next action: stop exploring this concept. Do not issue this call or an "
+            "equivalent search again"
+        )
+
+    def _workflow_guard(self, tool_call: ToolCall) -> str | None:
+        """Return corrective guidance when iterative-rules tools are out of order."""
+        if getattr(self, "prompt_name", "output-shape") not in _GUIDED_WORKFLOW_PROMPTS:
+            return None
+
+        tool_name = tool_call.name
+        if tool_name == "read_guide" and "search_guides" not in self._workflow_steps:
+            return "Workflow guard: call search_guides before read_guide."
+
+        if tool_name == "record_rules":
+            if "search_guides" not in self._workflow_steps:
+                return "Workflow guard: call search_guides before record_rules."
+            guide_status = tool_call.arguments.get("guide_status")
+            if (
+                guide_status != "no_relevant_guide"
+                and "read_guide" not in self._workflow_steps
+            ):
+                return (
+                    "Workflow guard: read the complete relevant guide with read_guide before "
+                    "recording applicable guide rules. If no search result is plausibly "
+                    "relevant, call record_rules with guide_status='no_relevant_guide' and "
+                    "record task rules only."
+                )
+            if tool_call.arguments.get("phase") == "revised":
+                if "rule_hypothesis" not in self._workflow_steps:
+                    return "Workflow guard: record a rule hypothesis before revising it."
+                if "describe_table" not in self._workflow_steps:
+                    return (
+                        "Workflow guard: inspect candidate tables with describe_table before "
+                        "recording the revised rule contract."
+                    )
+
+        if tool_name in _TOOLS_REQUIRING_RECORDED_RULES:
+            if "rule_hypothesis" not in self._workflow_steps:
+                return (
+                    f"Workflow guard: call record_rules with phase='hypothesis' before "
+                    f"{tool_name}. First search the guides, read the complete relevant guide, "
+                    "and record the important task and candidate guide rules."
+                )
+            if tool_name == "submit_answer" and "revised_rules" not in self._workflow_steps:
+                return (
+                    "Workflow guard: call record_rules with phase='revised' after inspecting "
+                    "the data and before submit_answer."
+                )
+
+        return None
+
+    def _record_workflow_step(self, tool_name: str, result: str) -> None:
+        """Update successful iterative-rules workflow checkpoints."""
+        if getattr(self, "prompt_name", "output-shape") not in _GUIDED_WORKFLOW_PROMPTS:
+            return
+
+        if tool_name == "search_guides":
+            self._workflow_steps.add(tool_name)
+        elif tool_name == "read_guide" and result.startswith("Guide:"):
+            self._workflow_steps.add(tool_name)
+            self._workflow_steps.discard("revised_rules")
+        elif tool_name == "record_rules" and result.startswith("Rule hypothesis:"):
+            self._workflow_steps.add("rule_hypothesis")
+            self._workflow_steps.discard("revised_rules")
+        elif tool_name == "record_rules" and result.startswith("Revised rule contract:"):
+            self._workflow_steps.add("revised_rules")
+        elif tool_name == "describe_table" and result.startswith("Columns in"):
+            self._workflow_steps.add("describe_table")
 
     def _generate_response(self, conversation: Conversation) -> Iterator[AgentEvent]:
         """Generate a response from the model, streaming the events out."""
@@ -344,20 +525,12 @@ class Agent:
 
     def _get_system_message(self) -> str:
         """Get the system message for the agent."""
-        return (
-            "You are an autonomous SQL agent. You must complete tasks independently "
-            "without asking the user for clarification or additional information. "
-            "Use the available tools to gather any information you need. "
-            "If you're uncertain, make your best assumptions and proceed.\n\n"
-            "CRITICAL: You MUST call the 'submit_answer' tool to complete EVERY task. "
-            "NEVER stop without calling submit_answer. Even if you've computed the answer, "
-            "you MUST submit it via submit_answer with a valid SQL query.\n\n"
-            "Do not provide answers as plain text - always use the submit_answer tool "
-            "with a valid SQL query that generates a dataframe with the intended answer."
-        )
+        prompt_name = getattr(self, "prompt_name", "output-shape")
+        return PROMPT_PATHS[prompt_name].read_text(encoding="utf-8").strip()
 
     def run(self, prompt: str) -> Iterator[AgentEvent]:
         """Run the agent with streaming output, from the user's natural language prompt."""
+        self._tested_queries = set()
         # Add the new user message to the ongoing conversation
         self.conversation.messages.append(Message(role="user", content=prompt))
 
@@ -390,14 +563,17 @@ class Agent:
                 # This happens when the model outputs tool call arguments as plain text
                 looks_like_failed_tool_call = (full_response and "{" in full_response)
 
-                if is_empty_response or looks_like_failed_tool_call:
-                    # Model returned empty response or malformed tool call
-                    # Inject a continuation prompt to remind it to properly call submit_answer
+                submission_required = "submit_answer" in self.tools
+                if submission_required or is_empty_response or looks_like_failed_tool_call:
+                    # The SQL workflow is incomplete until submit_answer is called.
                     if looks_like_failed_tool_call:
                         print("\n[DEBUG] Response looks like failed tool call "
                               "- injecting continuation prompt")
-                    else:
+                    elif is_empty_response:
                         print("\n[DEBUG] Empty response detected "
+                              "- injecting continuation prompt")
+                    else:
+                        print("\n[DEBUG] Response did not call submit_answer "
                               "- injecting continuation prompt")
 
                     self.conversation.messages.append(
@@ -482,6 +658,10 @@ class Agent:
 
     def reset_conversation(self) -> None:
         """Reset the conversation to the initial state (with system message)."""
+        self._workflow_steps: set[str] = set()
+        self._tool_call_results: dict[str, str] = {}
+        self._duplicate_tool_attempts: dict[str, int] = {}
+        self._tested_queries: set[str] = set()
         self.conversation = Conversation()
         self.conversation.messages.append(
             Message(role="system", content=self._get_system_message())

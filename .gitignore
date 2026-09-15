@@ -14,5 +14,9 @@ wheels/
 # Evaluation trace logs
 logs/
 
+# Generated analysis artifacts
+outputs/
+ui_catalog.db
+
 # Downloaded CTU databases (zipped version tracked with Git LFS)
 *.duckdb

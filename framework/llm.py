@@ -49,18 +49,26 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 class OpenRouterConfig:
     """Configuration for the OpenRouter API client.
 
-    Defaults to gpt-oss-120b on Cerebras provider.
+    Defaults to gpt-oss-120b on the Cerebras provider.
     """
 
-    model: str = "openai/gpt-oss-120b:nitro"
+    model: str = "openai/gpt-oss-120b"
     api_key: str = ""
-    max_tokens: int = 100000
-    temperature: float = 0.6
-    max_iterations: int = 30
-    # Provider routing - no restriction by default
-    provider: dict[str, Any] = field(default_factory=dict)
-    # Reasoning configuration
-    reasoning: dict[str, Any] | None = None
+    max_tokens: int = 15000
+    temperature: float = 0.0
+    max_iterations: int = 40
+    # Provider routing
+    provider: dict[str, Any] = field(
+        default_factory=lambda: {
+            "order": ["cerebras"],
+            "allow_fallbacks": False,
+            "require_parameters": True,
+        }
+    )
+    # Medium reasoning performed best in the full hard-set experiments.
+    reasoning: dict[str, Any] | None = field(
+        default_factory=lambda: {"effort": "medium"}
+    )
     # Timeout for receiving first token (also applies between subsequent chunks)
     # If no data is received within this time, the request will timeout
     first_token_timeout: float = 10.0

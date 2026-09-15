@@ -99,6 +99,15 @@ You can enter natural language questions, and the agent will respond.
 You can exit the REPL-like environment by typing "quit".
 You can start a new conversation by typing "reset".
 
+The agent discovers business guidance in two steps: `search_guides` searches guide names,
+Markdown headings, and body text, returning only short matching excerpts. Then `read_guide`
+loads the complete selected guide. This keeps irrelevant documentation out of the context
+while allowing applicable rules to inform schema exploration and the final SQL. The agent uses
+the `output-shape` workflow by default, which also preserves useful identity and component
+columns when they do not change the requested result grain. The earlier `original`, `baseline`,
+`human-workflow`, and `iterative-rules` prompts remain available for comparison; only
+`iterative-rules` adds the experimental `record_rules` tool.
+
 ## Evaluation
 
 To evaluate your agent, you can run the following command:
@@ -108,6 +117,46 @@ uv run evaluate --api-key YOUR_API_KEY --concurrency 16
 ```
 
 This will run the agent against the evaluation dataset and report the results.
+
+For quicker iteration, run the first N cases or select specific one-based case numbers:
+
+```bash
+uv run evaluate --api-key YOUR_API_KEY --split easy --limit 20
+uv run evaluate --api-key YOUR_API_KEY --split easy --cases 5,15,16,19
+```
+
+Select a retained prompt experiment with `--prompt` (the default is `output-shape`):
+
+```bash
+uv run evaluate --api-key YOUR_API_KEY --split hard --prompt human-workflow
+uv run evaluate --api-key YOUR_API_KEY --split hard --cases 15 --prompt iterative-rules
+```
+
+The agent only accepts a final answer after that exact SQL has succeeded through `run_query`.
+This prevents an untested edit from introducing a syntax error at submission time.
+
+Each run also writes two small files in its run directory:
+
+- `run_config.json` records the prompt, selected cases, concurrency, tools, model, provider,
+  reasoning effort, temperature, token and iteration limits, timeout, and context compression.
+- `run_summary.json` records pass, mismatch, other-failure, failure-type, pass-rate, and token
+  totals for the overall run and each split.
+
+To turn every JSON trace in a run into readable Markdown timelines, provide its split run
+directory:
+
+```bash
+uv run summarize-eval-logs logs/run_20260911_192231/evals_hard
+```
+
+This creates a `summaries` folder containing an index and one report per case. To inspect only
+one case, provide its one-based case number:
+
+```bash
+uv run summarize-eval-logs logs/run_20260911_192231/evals_hard --case 13
+```
+
+The report is written beside the trace as `case_13_summary.md`.
 
 ## Goal
 

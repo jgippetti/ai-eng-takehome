@@ -11,25 +11,43 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
-from framework.agent import Agent, Tool
+from framework.agent import PROMPT_PATHS, Agent, Tool, prompt_requires_record_rules
 from framework.llm import OpenRouterConfig
 from framework.stream_printer import StreamPrinter
+from tools.guide_tools import READ_GUIDE, SEARCH_GUIDES
+from tools.record_rules import RECORD_RULES
+from tools.run_query import RUN_QUERY
+from tools.schema_tools import (
+    DESCRIBE_TABLE,
+    LIST_SCHEMAS,
+    LIST_TABLES,
+    SEARCH_CATALOG,
+)
 from tools.submit_answer import SUBMIT_ANSWER
 
 
-def create_tools() -> dict[str, Tool]:
+def create_tools(*, include_record_rules: bool = False) -> dict[str, Tool]:
     """Create the tools for the agent.
 
     Returns:
         Dictionary mapping tool names to Tool instances.
     """
-    return {
+    tools = {
+        SEARCH_GUIDES.name: SEARCH_GUIDES,
+        READ_GUIDE.name: READ_GUIDE,
+        LIST_SCHEMAS.name: LIST_SCHEMAS,
+        SEARCH_CATALOG.name: SEARCH_CATALOG,
+        LIST_TABLES.name: LIST_TABLES,
+        DESCRIBE_TABLE.name: DESCRIBE_TABLE,
+        RUN_QUERY.name: RUN_QUERY,
         SUBMIT_ANSWER.name: SUBMIT_ANSWER,
-        # You can add your own tools here to test!
     }
+    if include_record_rules:
+        tools[RECORD_RULES.name] = RECORD_RULES
+    return tools
 
 
-def create_agent(api_key: str) -> Agent:
+def create_agent(api_key: str, prompt_name: str = "output-shape") -> Agent:
     """Create and configure the agent with default settings.
 
     Args:
@@ -42,8 +60,8 @@ def create_agent(api_key: str) -> Agent:
         api_key=api_key,
         # Defaults to gpt-oss-120b on Cerebras
     )
-    tools = create_tools()
-    return Agent(config=config, tools=tools)
+    tools = create_tools(include_record_rules=prompt_requires_record_rules(prompt_name))
+    return Agent(config=config, tools=tools, prompt_name=prompt_name)
 
 
 def print_welcome(console: Console) -> None:
@@ -83,6 +101,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="OpenRouter API key",
     )
+    parser.add_argument(
+        "--prompt",
+        choices=tuple(PROMPT_PATHS),
+        default="output-shape",
+        help="System prompt variant to use (default: output-shape).",
+    )
     return parser.parse_args()
 
 
@@ -101,7 +125,7 @@ def main() -> None:
     print_welcome(console)
 
     console.print("\n[dim]Connecting to OpenRouter...[/dim]")
-    agent = create_agent(args.api_key)
+    agent = create_agent(args.api_key, prompt_name=args.prompt)
     console.print("[green]Connected successfully![/green]\n")
 
     while True:
