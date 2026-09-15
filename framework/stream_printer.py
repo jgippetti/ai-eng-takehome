@@ -87,7 +87,9 @@ class StreamPrinter:
                     result = event.data.get("result", "")
                     # Truncate long results for display
                     display_result = (
-                        result[:1000] + "\n...(truncated for display)" if len(result) > 1000 else result
+                        result[:1000] + "\n...(truncated for display)"
+                        if len(result) > 1000
+                        else result
                     )
                     self.console.print(escape(f"[Tool Result] {name}:"), style="green")
                     self.console.print(escape(display_result))

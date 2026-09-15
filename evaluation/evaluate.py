@@ -46,15 +46,31 @@ from rich.table import Table
 from rich.text import Text
 
 from evaluation.compare import loosely_compare_dataframes
-from framework.agent import ANSWER_SUBMITTED_PREFIX, Agent, AgentEvent, EventType, Tool
+from framework.agent import (
+    ANSWER_SUBMITTED_PREFIX,
+    PROMPT_PATHS,
+    Agent,
+    AgentEvent,
+    EventType,
+    Tool,
+    prompt_requires_record_rules,
+)
 from framework.database import execute_query
 from framework.llm import OpenRouterConfig, TokenUsage
+from tools.guide_tools import READ_GUIDE, SEARCH_GUIDES
+from tools.record_rules import RECORD_RULES
+from tools.run_query import RUN_QUERY
+from tools.schema_tools import (
+    DESCRIBE_TABLE,
+    LIST_SCHEMAS,
+    LIST_TABLES,
+    SEARCH_CATALOG,
+)
 from tools.submit_answer import SUBMIT_ANSWER
 
 # =============================================================================
 # Evaluation Configuration
 # =============================================================================
-
 
 @dataclass
 class EvalConfig:
@@ -72,6 +88,40 @@ class EvalConfig:
         if self.verbose:
             timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
             print(f"[{timestamp}] {message}", file=sys.stderr, flush=True)
+
+
+def build_run_config(
+    args: argparse.Namespace,
+    tools: dict[str, Tool],
+    llm_config: OpenRouterConfig | None = None,
+) -> dict[str, Any]:
+    """Return the effective, non-secret configuration for an evaluation run."""
+    llm = llm_config or OpenRouterConfig()
+    return {
+        "created_at": datetime.now(UTC).isoformat(),
+        "evaluation": {
+            "split": args.split,
+            "cases": args.cases,
+            "limit": args.limit,
+            "concurrency": args.concurrency,
+            "prompt": args.prompt,
+            "tools": list(tools),
+        },
+        "model": {
+            "name": llm.model,
+            "provider": llm.provider,
+            "reasoning": llm.reasoning,
+            "temperature": llm.temperature,
+            "max_tokens": llm.max_tokens,
+            "max_iterations": llm.max_iterations,
+            "first_token_timeout": llm.first_token_timeout,
+        },
+        "context_compression": {
+            "enabled": llm.compress_context,
+            "keep_recent": llm.compress_keep_recent,
+            "max_chars": llm.compress_max_chars,
+        },
+    }
 
 
 def _event_to_dict(event: AgentEvent) -> dict[str, Any]:
@@ -134,7 +184,7 @@ def save_trace(
 # =============================================================================
 
 
-def create_tools() -> dict[str, Tool]:
+def create_tools(*, include_record_rules: bool = False) -> dict[str, Tool]:
     """Create the tools for the agent.
 
     Modify this function to add or remove tools from the agent.
@@ -143,11 +193,19 @@ def create_tools() -> dict[str, Tool]:
     Returns:
         A dictionary mapping tool names to Tool objects.
     """
-    return {
+    tools = {
+        SEARCH_GUIDES.name: SEARCH_GUIDES,
+        READ_GUIDE.name: READ_GUIDE,
+        LIST_SCHEMAS.name: LIST_SCHEMAS,
+        SEARCH_CATALOG.name: SEARCH_CATALOG,
+        LIST_TABLES.name: LIST_TABLES,
+        DESCRIBE_TABLE.name: DESCRIBE_TABLE,
+        RUN_QUERY.name: RUN_QUERY,
         SUBMIT_ANSWER.name: SUBMIT_ANSWER,
-        # Add your custom tools here:
-        # MY_TOOL.name: MY_TOOL,
     }
+    if include_record_rules:
+        tools[RECORD_RULES.name] = RECORD_RULES
+    return tools
 
 
 # =============================================================================
@@ -256,6 +314,43 @@ def load_eval_cases(eval_file: Path) -> list[EvalCase]:
     return [EvalCase(prompt=item["prompt"], gold_query=item["query"]) for item in data]
 
 
+def parse_case_numbers(value: str) -> list[int]:
+    """Parse a comma-separated list of one-based evaluation case numbers."""
+    try:
+        case_numbers = [int(part.strip()) for part in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "cases must be comma-separated integers, such as 5,15,16"
+        ) from error
+
+    if not case_numbers or any(number < 1 for number in case_numbers):
+        raise argparse.ArgumentTypeError("case numbers must be positive integers")
+    if len(case_numbers) != len(set(case_numbers)):
+        raise argparse.ArgumentTypeError("case numbers must not contain duplicates")
+    return case_numbers
+
+
+def positive_int(value: str) -> int:
+    """Parse a positive integer for an argparse option."""
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return number
+
+
+def select_eval_cases(
+    cases: list[EvalCase], case_numbers: list[int]
+) -> list[EvalCase]:
+    """Select evaluation cases by one-based position."""
+    invalid_numbers = [number for number in case_numbers if number > len(cases)]
+    if invalid_numbers:
+        invalid = ", ".join(str(number) for number in invalid_numbers)
+        raise ValueError(
+            f"Case number(s) out of range: {invalid}; split has {len(cases)} cases"
+        )
+    return [cases[number - 1] for number in case_numbers]
+
+
 def extract_submitted_answer_from_events(
     agent: Agent,
     case: EvalCase,
@@ -299,7 +394,6 @@ def extract_submitted_answer_from_events(
         elif event.type == EventType.TOOL_EXECUTION_END:
             tool_name = event.data.get("name", "unknown")
             config.log_verbose(f"    Tool {tool_name} completed")
-
         # Check for agent errors
         if event.type == EventType.AGENT_ERROR:
             error = event.data.get("error", "Unknown")
@@ -565,6 +659,7 @@ def _run_single_eval_worker(
     case_index: int,
     tools: dict[str, Tool],
     api_key: str,
+    prompt_name: str,
     log_dir: Path | None = None,
     verbose: bool = False,
 ) -> tuple[int, EvalResult]:
@@ -588,7 +683,7 @@ def _run_single_eval_worker(
 
     # Each worker creates its own agent to avoid shared state
     llm_config = OpenRouterConfig(api_key=api_key)
-    agent = Agent(config=llm_config, tools=tools)
+    agent = Agent(config=llm_config, tools=tools, prompt_name=prompt_name)
     result = run_single_eval(agent, case, eval_config)
     return case_index, result
 
@@ -602,6 +697,8 @@ def evaluate_split(
     log_dir: Path | None = None,
     max_cases: int | None = None,
     verbose: bool = False,
+    case_numbers: list[int] | None = None,
+    prompt_name: str = "output-shape",
 ) -> EvalSplitResults:
     """Run evaluation on a single split.
 
@@ -614,6 +711,7 @@ def evaluate_split(
         log_dir: Optional directory to save agent traces to.
         max_cases: Optional limit on the number of cases to run.
         verbose: Whether to enable verbose logging.
+        case_numbers: Optional one-based case numbers to run.
 
     Returns:
         EvalSplitResults containing all results for this split.
@@ -621,13 +719,15 @@ def evaluate_split(
     split_name = eval_file.stem
     cases = load_eval_cases(eval_file)
 
-    # Limit cases if max_cases is specified
-    if max_cases is not None and max_cases < len(cases):
+    if case_numbers is not None:
+        cases = select_eval_cases(cases, case_numbers)
+        selected = ",".join(str(number) for number in case_numbers)
+        split_name = f"{split_name} (cases {selected})"
+    elif max_cases is not None and max_cases < len(cases):
         cases = cases[:max_cases]
         split_name = f"{split_name} (first {max_cases})"
 
     split_results = EvalSplitResults(name=split_name)
-
     # Set up logging for this split
     split_log_dir: Path | None = None
     if log_dir is not None:
@@ -642,7 +742,7 @@ def evaluate_split(
     if concurrency == 1:
         # Sequential execution (original behavior)
         llm_config = OpenRouterConfig(api_key=api_key)
-        agent = Agent(config=llm_config, tools=tools)
+        agent = Agent(config=llm_config, tools=tools, prompt_name=prompt_name)
         eval_config = EvalConfig(verbose=verbose, log_dir=split_log_dir)
 
         with Live(
@@ -684,6 +784,7 @@ def evaluate_split(
                         idx,
                         tools,
                         api_key,
+                        prompt_name,
                         split_log_dir,
                         verbose,
                     ): idx
@@ -933,6 +1034,53 @@ def print_summary(
                         render_comparison_failure(result, console)
 
 
+def save_run_summary(all_results: list[EvalSplitResults], log_dir: Path) -> Path:
+    """Write compact result and token totals for an evaluation run."""
+
+    def summarize(results: list[EvalResult]) -> dict[str, Any]:
+        passed = sum(result.passed for result in results)
+        mismatch = sum(
+            result.failure_type == FailureType.MISMATCH for result in results
+        )
+        failure_types: dict[str, int] = {}
+        usage = TokenUsage()
+        for result in results:
+            if not result.passed:
+                name = result.failure_type.name
+                failure_types[name] = failure_types.get(name, 0) + 1
+            if result.usage is not None:
+                usage = usage + result.usage
+
+        total = len(results)
+        return {
+            "passed": passed,
+            "mismatch": mismatch,
+            "other": total - passed - mismatch,
+            "total": total,
+            "pass_rate": passed / total if total else 0.0,
+            "failure_types": failure_types,
+            "token_usage": {
+                "input": usage.prompt_tokens,
+                "output": usage.completion_tokens,
+                "total": usage.total_tokens,
+            },
+        }
+
+    combined_results = [
+        result for split_results in all_results for result in split_results.results
+    ]
+    summary = {
+        "overall": summarize(combined_results),
+        "splits": [
+            {"name": split_results.name, **summarize(split_results.results)}
+            for split_results in all_results
+        ],
+    }
+    summary_path = log_dir / "run_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return summary_path
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -961,6 +1109,23 @@ def parse_args() -> argparse.Namespace:
         default="hard",
         help="Which evaluation split to run: 'easy', 'hard', or 'both' (default: hard)",
     )
+    parser.add_argument(
+        "--prompt",
+        choices=tuple(PROMPT_PATHS),
+        default="output-shape",
+        help="System prompt variant to use (default: output-shape).",
+    )
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--limit",
+        type=positive_int,
+        help="Run only the first N cases in the selected split.",
+    )
+    selection.add_argument(
+        "--cases",
+        type=parse_case_numbers,
+        help="Run specific one-based case numbers, such as 5,15,16,19.",
+    )
     return parser.parse_args()
 
 
@@ -973,8 +1138,15 @@ def main() -> None:
     console.print("[dim]Loading tools and preparing agent...[/dim]\n")
 
     # Get tools from the configurable function
-    tools = create_tools()
+    tools = create_tools(
+        include_record_rules=prompt_requires_record_rules(args.prompt)
+    )
+    llm_config = OpenRouterConfig(api_key=args.api_key)
     console.print(f"[dim]Agent tools: {', '.join(tools.keys())}[/dim]")
+    console.print(f"[dim]Prompt: {args.prompt}[/dim]")
+    console.print(f"[dim]Model: {llm_config.model}[/dim]")
+    console.print(f"[dim]Provider: {llm_config.provider}[/dim]")
+    console.print(f"[dim]Reasoning: {llm_config.reasoning}[/dim]")
     if args.concurrency > 1:
         console.print(f"[dim]Concurrency: {args.concurrency}[/dim]")
 
@@ -982,6 +1154,10 @@ def main() -> None:
     timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     log_dir = Path("logs") / f"run_{timestamp}"
     log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "run_config.json").write_text(
+        json.dumps(build_run_config(args, tools, llm_config), indent=2) + "\n",
+        encoding="utf-8",
+    )
     console.print(f"[dim]Saving traces to: {log_dir}[/dim]")
 
     # Find evaluation files based on split argument
@@ -996,8 +1172,6 @@ def main() -> None:
             data_dir / "evals_easy.json",
             data_dir / "evals_hard.json",
         ]
-    max_cases = None
-
     # Filter to existing files
     eval_files = [f for f in eval_files if f.exists()]
 
@@ -1016,8 +1190,10 @@ def main() -> None:
                 args.api_key,
                 args.concurrency,
                 log_dir,
-                max_cases,
-                args.verbose,
+                max_cases=args.limit,
+                verbose=args.verbose,
+                case_numbers=args.cases,
+                prompt_name=args.prompt,
             )
             all_results.append(results)
         except KeyboardInterrupt:
@@ -1029,6 +1205,10 @@ def main() -> None:
         # Print final summary
         if all_results:
             print_summary(all_results, console, verbose=args.verbose)
+
+    if all_results:
+        summary_path = save_run_summary(all_results, log_dir)
+        console.print(f"[dim]Saved run summary to: {summary_path}[/dim]")
 
 
 if __name__ == "__main__":

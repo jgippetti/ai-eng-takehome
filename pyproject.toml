@@ -27,6 +27,7 @@ dependencies = [
 
 [project.scripts]
 evaluate = "evaluation.evaluate:main"
+summarize-eval-logs = "evaluation.summarize_eval_logs:main"
 interactive = "interactive:main"
 
 [tool.ty.environment]
